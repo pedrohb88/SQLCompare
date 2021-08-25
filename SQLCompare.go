@@ -21,16 +21,17 @@ type Index struct {
 }
 
 type Constraint struct {
-	Name  string
-	Type  string
-	Other string
+	Name       string
+	ColumnName string
+	Type       string
+	Other      string
 }
 
 type Table struct {
 	Name        string
 	Columns     map[string]Column
 	Indexes     map[string]Index
-	Constraints map[string][]Constraint
+	Constraints map[string](map[string]Constraint)
 }
 
 const (
@@ -81,7 +82,56 @@ func main() {
 	//printTables(tablesB)
 
 	diffs := compareTables(tablesA, tablesB)
+	diffs = groupByType(diffs)
+
 	printDiffs(diffs, args[1], args[2])
+}
+
+func groupByType(ds []Diff) []Diff {
+
+	missingTable := make([]Diff, 0)
+	missingColumn := make([]Diff, 0)
+	wrongColumnType := make([]Diff, 0)
+	wrongColumnOther := make([]Diff, 0)
+	missingIndex := make([]Diff, 0)
+	missingConstraint := make([]Diff, 0)
+	wrongConstraintOther := make([]Diff, 0)
+
+	for _, d := range ds {
+
+		switch d.Type {
+		case MissingTable:
+			missingTable = append(missingTable, d)
+		case MissingColumn:
+			missingColumn = append(missingColumn, d)
+		case WrongColumnType:
+			wrongColumnType = append(wrongColumnType, d)
+		case WrongColumnOther:
+			wrongColumnOther = append(wrongColumnOther, d)
+		case MissingIndex:
+			missingIndex = append(missingIndex, d)
+		case MissingConstraint:
+			missingConstraint = append(missingConstraint, d)
+		case WrongConstraintOther:
+			wrongConstraintOther = append(wrongConstraintOther, d)
+		}
+	}
+
+	slices := [][]Diff{
+		missingTable,
+		missingColumn,
+		wrongColumnType,
+		wrongColumnOther,
+		missingConstraint,
+		wrongConstraintOther,
+		missingIndex,
+	}
+
+	var res []Diff
+	for _, slice := range slices {
+		res = append(res, slice...)
+	}
+	return res
 }
 
 func compareTables(tableMapA map[string]Table, tableMapB map[string]Table) []Diff {
@@ -132,6 +182,46 @@ func compareTables(tableMapA map[string]Table, tableMapB map[string]Table) []Dif
 				})
 			}
 		}
+
+		for _, indexA := range tableA.Indexes {
+
+			_, indexExists := tableB.Indexes[indexA.ColumnName]
+			if !indexExists {
+				diffs = append(diffs, Diff{
+					Type:   MissingIndex,
+					Target: fmt.Sprintf("%s.%s", tableA.Name, indexA.ColumnName),
+					A:      indexA.Name,
+					B:      "",
+				})
+			}
+		}
+
+		for columnNameA, columnsWithConstraintsA := range tableA.Constraints {
+
+			for constraintTypeA, constraintA := range columnsWithConstraintsA {
+
+				constraintB, exists := tableB.Constraints[columnNameA][constraintTypeA]
+				if !exists {
+					diffs = append(diffs, Diff{
+						Type:   MissingConstraint,
+						Target: fmt.Sprintf("%s.%s", tableA.Name, columnNameA),
+						A:      constraintA.Type,
+						B:      "",
+					})
+					continue
+				}
+
+				if constraintA.Other != constraintB.Other {
+					diffs = append(diffs, Diff{
+						Type:   WrongConstraintOther,
+						Target: fmt.Sprintf("%s.%s.%s", tableA.Name, columnNameA, constraintA.Type),
+						A:      constraintA.Other,
+						B:      constraintB.Other,
+					})
+				}
+
+			}
+		}
 	}
 
 	return diffs
@@ -142,7 +232,7 @@ func parseTables(data string) map[string]Table {
 	tables := make(map[string]Table)
 	var analyzingTable bool
 
-	keywords := []string{"PRIMARY", "KEY", "CONSTRAINT"}
+	keywords := []string{"PRIMARY", "KEY", "CONSTRAINT", "UNIQUE"}
 	isKeyword := func(str string) bool {
 		for _, v := range keywords {
 			if str == v || str == "" || str == "--" {
@@ -171,7 +261,9 @@ func parseTables(data string) map[string]Table {
 			tableName := strings.Trim(infos[2], "`")
 			cols := make(map[string]Column)
 			indexes := make(map[string]Index)
-			constraints := make(map[string][]Constraint)
+
+			constraints := make(map[string](map[string]Constraint))
+
 			table = Table{Name: tableName, Columns: cols, Indexes: indexes, Constraints: constraints}
 			continue
 		}
@@ -191,6 +283,71 @@ func parseTables(data string) map[string]Table {
 			table.Columns[name] = column
 
 			continue
+		}
+
+		//indexes definitions
+		if analyzingTable && infos[0] == "KEY" {
+
+			name := strings.Trim(infos[1], "`")
+			columnName := strings.Trim(infos[2], ",")
+			columnName = strings.Trim(columnName, "(")
+			columnName = strings.Trim(columnName, ")")
+			columnName = strings.Trim(columnName, "`")
+
+			index := Index{
+				Name:       name,
+				ColumnName: columnName,
+			}
+
+			table.Indexes[columnName] = index
+		}
+
+		//constraints definitions
+		if analyzingTable && infos[0] == "CONSTRAINT" {
+
+			name := strings.Trim(infos[1], "`")
+
+			columnName := strings.Trim(infos[4], "(")
+			columnName = strings.Trim(columnName, ")")
+			columnName = strings.Trim(columnName, "`")
+
+			constraintType := infos[2]
+
+			other := strings.Join(infos[5:], " ")
+			other = strings.Trim(other, ",")
+
+			constraint := Constraint{
+				Name:       name,
+				ColumnName: columnName,
+				Type:       constraintType,
+				Other:      other,
+			}
+			if table.Constraints[columnName] == nil {
+				table.Constraints[columnName] = make(map[string]Constraint)
+			}
+			table.Constraints[columnName][constraintType] = constraint
+		}
+
+		if analyzingTable && (infos[0] == "PRIMARY" || infos[0] == "UNIQUE") {
+
+			columnName := strings.Trim(infos[2], ",")
+			columnName = strings.Trim(columnName, "(")
+			columnName = strings.Trim(columnName, ")")
+			columnName = strings.Trim(columnName, "`")
+
+			constraintType := infos[0]
+			name := columnName
+
+			constraint := Constraint{
+				Name:       name,
+				ColumnName: columnName,
+				Type:       constraintType,
+				Other:      "",
+			}
+			if table.Constraints[columnName] == nil {
+				table.Constraints[columnName] = make(map[string]Constraint)
+			}
+			table.Constraints[columnName][constraintType] = constraint
 		}
 	}
 	tables[table.Name] = table
